@@ -131,4 +131,3 @@ Laser-Pen-ESP32/
 
 ---
 ```
- Gru
