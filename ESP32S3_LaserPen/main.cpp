@@ -1,14 +1,18 @@
 /**
- * =============================================================================
- * MODULE: TRẠM XỬ LÝ TRUNG TÂM (ESP32-S3)
- * Dự án: Thiết bị Bút thông minh (Smart Pen)
- * * Chức năng chính:
- * 1. Nhận dữ liệu thao tác nút bấm/cuộn từ Bút qua giao thức ESP-NOW.
- * 2. Nhận tọa độ (x, y) của tia laser từ Camera qua giao tiếp UART.
- * 3. Xử lý thuật toán biến đổi không gian (Homography) để tính tọa độ chuột.
- * 4. Giao tiếp với máy tính như một chuột không dây qua Bluetooth HID.
- * 5. Quản lý giao diện hiển thị OLED và các tác vụ đa luồng bằng FreeRTOS.
- * =============================================================================
+ * @file main.cpp
+ * @brief Central Processing Hub & HID Controller for the Laser Pen project.
+ * * @author Nguyen Huu Luan (ID: 20200253)
+ * @institution VNUHCM - University of Science, Dept. of Electronics & Telecommunications
+ * * CORE ALGORITHMS & FEATURES:
+ * 1. Planar Homography Transformation: Solves an 8-variable linear equation system using 
+ * Gauss-Jordan elimination (double precision) to non-linearly map Camera coordinates 
+ * to Display coordinates (1920x1080).
+ * 2. Absolute Mouse Synchronization: Fires a rapid sequence of bounding commands to force 
+ * the OS cursor to the absolute origin (0,0) before applying precise BLE HID offsets.
+ * 3. Exponential Moving Average (EMA): Applies a digital low-pass filter (Alpha tuning) 
+ * to the output coordinates to eliminate physiological hand tremors.
+ * 4. ESP-NOW Telemetry & UI: Manages full-duplex communication with the Vision module 
+ * and Pen TX, updating the local I2C OLED dashboard with real-time states and FPS.
  */
 
 #include <Arduino.h>
@@ -25,20 +29,47 @@
 #define SCREEN_HEIGHT 64
 Adafruit_SH1106G display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 
-// ================= KHAI BÁO CHÂN =================
-#define LED_R_PIN 4
-#define LED_G_PIN 5
-#define LED_B_PIN 6
-#define LASER_CROSS_PIN 15
+// ================= SAFE PIN DECLARATIONS =================
+// Button for OLED menu navigation function
 #define BTN_MODE_PIN 1
-
 #define BTN_UP_PIN 2
 #define BTN_DOWN_PIN 21
+
+// Mouse buttons integrated on pen body
+#define BTN_LEFT_PIN 14
+#define BTN_RIGHT_PIN 11
+#define BTN_NEXT_PIN 16
+#define BTN_PREV_PIN 17
+#define BTN_CAL_PIN 18
+
+// Page scroll encoder
+#define ENC_A_PIN 12
+#define ENC_B_PIN 13
+
+// Battery pin reading
 #define LOCAL_BAT_PIN 10
 
 BleMouse bleMouse("LASER PEN", "Espressif", 100);
 
-// ================= CẤU TRÚC DỮ LIỆU ĐÃ ĐỒNG BỘ =================
+// MAC address of ESP32-CAM
+static uint8_t s_cam_mac[] = {0x3C, 0x61, 0x05, 0x23, 0x8F, 0xD8};
+
+// ================= ESP-NOW SYNCHRONIZATION DATA STRUCTURES =================
+typedef struct __attribute__((packed))
+{
+    float x;
+    float y;
+} cam_packet_t;
+
+typedef struct __attribute__((packed))
+{
+    char cmd; // 'C', 'B', 'E', 'T', 'V', 'L'
+    int val_ex;
+    int val_th;
+    int val_v;
+    int val_rf;
+} cam_config_packet_t;
+
 typedef struct __attribute__((packed))
 {
     int8_t scroll;
@@ -46,20 +77,8 @@ typedef struct __attribute__((packed))
     uint8_t battery;
     uint8_t state;
 } pen_packet_t;
-typedef struct __attribute__((packed))
-{
-    float x;
-    float y;
-} cam_packet_t;
-#define PACKET_HEADER 0x55AA
-typedef struct __attribute__((packed))
-{
-    uint16_t header;
-    float x;
-    float y;
-} cam_uart_packet_t;
 
-// ================= BIẾN TOÀN CỤC & TRẠNG THÁI =================
+// ================= GLOBAL VARIABLES & STATE =================
 enum State
 {
     WAIT_SYNC,
@@ -67,17 +86,13 @@ enum State
     CAL_PT_2,
     CAL_PT_3,
     CAL_PT_4,
-    COMPUTE_H,
     TRACKING
 };
 volatile State state = WAIT_SYNC;
 volatile State next_state = CAL_PT_1;
 volatile bool is_rebooting = false;
 
-volatile uint8_t pen_battery = 0;
-volatile uint8_t pen_state = 0;
 volatile uint8_t local_battery = 0;
-
 volatile uint32_t last_tune_time = 0;
 
 enum TuneMode
@@ -108,8 +123,9 @@ QueueHandle_t penQueue, camQueue, btnQueue;
 SemaphoreHandle_t hidMutex;
 
 uint8_t lastButtons = 0;
+volatile uint8_t g_display_buttons = 0;
 volatile uint32_t frame_count = 0, current_fps = 0, last_fps_time = 0;
-volatile uint32_t last_pen_time = 0, last_cam_time = 0;
+volatile uint32_t last_cam_time = 0;
 
 float H[3][3];
 float cam_pts[4][2];
@@ -117,52 +133,76 @@ float cam_pts[4][2];
 #define OLED_SLEEP_TIMEOUT_MS 60000
 volatile uint32_t last_system_activity = 0;
 
-// ================= KHAI BÁO HÀM =================
+// Local encoder handling variables
+static volatile int8_t s_enc_delta = 0;
+static volatile uint8_t s_enc_last = 0;
+static portMUX_TYPE s_mux = portMUX_INITIALIZER_UNLOCKED;
+static const int8_t ENC_TABLE[16] = {0, -1, 1, 0, 1, 0, 0, -1, -1, 0, 0, 1, 0, 1, -1, 0};
+
+void IRAM_ATTR encoderISR()
+{
+    uint8_t curr_state = (digitalRead(ENC_A_PIN) << 1) | digitalRead(ENC_B_PIN);
+    uint8_t idx = (s_enc_last << 2) | curr_state;
+    int8_t move = ENC_TABLE[idx];
+    if (move != 0)
+    {
+        portENTER_CRITICAL_ISR(&s_mux);
+        s_enc_delta += move;
+        portEXIT_CRITICAL_ISR(&s_mux);
+    }
+    s_enc_last = curr_state;
+}
+
+// ================= RECEIVE DATA VIA ESP-NOW =================
+void onDataRecv(const uint8_t *mac_addr, const uint8_t *incomingData, int len)
+{
+    if (len == sizeof(cam_packet_t))
+    {
+        cam_packet_t packet;
+        memcpy(&packet, incomingData, sizeof(packet));
+        xQueueOverwriteFromISR(camQueue, &packet, NULL);
+        last_cam_time = millis();
+    }
+}
+
 void displayTask(void *pv);
 void mainTask(void *pv);
+void localInputTask(void *pv);
 void penTask(void *pv);
-void camUartTask(void *pv);
-void ledTask(void *pv);
 void tuningTask(void *pv);
 void computeHomography();
 void updateBootScreen(int progress, const char *message);
-void sendTuningToCam();
+void sendTuningToCam(char cmd, int v1, int v2, int v3, int v4);
+void sendLaserToCam(bool on);
 void drawBatteryIcon(int x, int y, uint8_t percent, uint8_t state, bool is_lost);
 void updateLocalBattery();
-
-// ================= NHẬN ESP-NOW =================
-void onDataRecv(const uint8_t *mac_addr, const uint8_t *incomingData, int len)
-{
-    if (len == sizeof(pen_packet_t))
-    {
-        pen_packet_t packet;
-        memcpy(&packet, incomingData, sizeof(packet));
-        xQueueSendFromISR(penQueue, &packet, NULL);
-        last_pen_time = millis();
-        pen_battery = packet.battery;
-        pen_state = packet.state;
-    }
-}
 
 // ================= SETUP =================
 void setup()
 {
     Serial.begin(115200);
     delay(500);
-    Serial1.begin(115200, SERIAL_8N1, 47, 48);
 
-    pinMode(LED_R_PIN, OUTPUT);
-    pinMode(LED_G_PIN, OUTPUT);
-    pinMode(LED_B_PIN, OUTPUT);
-    pinMode(LASER_CROSS_PIN, OUTPUT);
     pinMode(BTN_MODE_PIN, INPUT_PULLUP);
     pinMode(BTN_UP_PIN, INPUT_PULLUP);
     pinMode(BTN_DOWN_PIN, INPUT_PULLUP);
 
+    pinMode(BTN_LEFT_PIN, INPUT_PULLUP);
+    pinMode(BTN_RIGHT_PIN, INPUT_PULLUP);
+    pinMode(BTN_NEXT_PIN, INPUT_PULLUP);
+    pinMode(BTN_PREV_PIN, INPUT_PULLUP);
+    pinMode(BTN_CAL_PIN, INPUT_PULLUP);
+
+    pinMode(ENC_A_PIN, INPUT_PULLUP);
+    pinMode(ENC_B_PIN, INPUT_PULLUP);
+
+    attachInterrupt(digitalPinToInterrupt(ENC_A_PIN), encoderISR, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(ENC_B_PIN), encoderISR, CHANGE);
+
     Wire.begin();
     Wire.setClock(400000);
     display.begin(0x3C, true);
-    updateBootScreen(10, "Init UART...");
+    updateBootScreen(10, "Init IO...");
 
     WiFi.mode(WIFI_STA);
     esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
@@ -170,6 +210,13 @@ void setup()
     if (esp_now_init() != ESP_OK)
         return;
     esp_now_register_recv_cb(onDataRecv);
+
+    esp_now_peer_info_t peerInfo;
+    memset(&peerInfo, 0, sizeof(peerInfo));
+    memcpy(peerInfo.peer_addr, s_cam_mac, 6);
+    peerInfo.channel = 1;
+    peerInfo.encrypt = false;
+    esp_now_add_peer(&peerInfo);
 
     updateBootScreen(70, "Init Bluetooth...");
     bleMouse.begin();
@@ -200,16 +247,16 @@ void setup()
     updateBootScreen(100, "System Ready!");
     delay(500);
 
-    xTaskCreatePinnedToCore(displayTask, "DSPL", 4096, NULL, 1, NULL, 0);
-    xTaskCreatePinnedToCore(ledTask, "LED", 2048, NULL, 1, NULL, 0);
+    xTaskCreatePinnedToCore(displayTask, "DSPL", 4096, NULL, 2, NULL, 1);
     xTaskCreatePinnedToCore(tuningTask, "TUNE", 2048, NULL, 1, NULL, 0);
+    xTaskCreatePinnedToCore(localInputTask, "INPUT", 3072, NULL, 3, NULL, 1);
     xTaskCreatePinnedToCore(penTask, "PEN", 4096, NULL, 3, NULL, 1);
-    xTaskCreatePinnedToCore(camUartTask, "UART", 4096, NULL, 4, NULL, 1);
     xTaskCreatePinnedToCore(mainTask, "MAIN", 8192, NULL, 2, NULL, 1);
 }
+
 void loop() { vTaskDelay(portMAX_DELAY); }
 
-// ================= HÀM ĐỌC PIN =================
+// ================= READ BATTERY PERCENTAGE =================
 void updateLocalBattery()
 {
     analogSetPinAttenuation(LOCAL_BAT_PIN, ADC_11db);
@@ -220,18 +267,96 @@ void updateLocalBattery()
         delay(2);
     }
     mv /= 10;
-    int max_mv = 1550;
-    int min_mv = 1200;
+    int max_mv = 4200;
+    int min_mv = 3300;
     int percent = map(mv, min_mv, max_mv, 0, 100);
     local_battery = constrain(percent, 0, 100);
 }
 
-// ================= TASK TUNING =================
+// ================= BUTTON DEBOUNCE =================
+#define NUM_BUTTONS 5
+const uint8_t BUTTON_PINS[NUM_BUTTONS] = {BTN_LEFT_PIN, BTN_RIGHT_PIN, BTN_NEXT_PIN, BTN_PREV_PIN, BTN_CAL_PIN};
+const uint8_t BUTTON_MASKS[NUM_BUTTONS] = {0x01, 0x02, 0x04, 0x08, 0x10};
+
+void localInputTask(void *pv)
+{
+    uint8_t last_raw_state = 0;
+    uint8_t debounced_state = 0;
+    uint8_t last_sent_buttons = 0;
+    uint32_t last_debounce_time[NUM_BUTTONS] = {0};
+    const uint32_t debounce_delay_ms = 25;
+
+    for (int i = 0; i < NUM_BUTTONS; i++)
+    {
+        pinMode(BUTTON_PINS[i], INPUT_PULLUP);
+    }
+
+    while (1)
+    {
+        pen_packet_t local_pkt = {0};
+        uint32_t now = millis();
+
+        portENTER_CRITICAL(&s_mux);
+        local_pkt.scroll = s_enc_delta;
+        s_enc_delta = 0;
+        portEXIT_CRITICAL(&s_mux);
+
+        local_pkt.scroll = constrain(local_pkt.scroll, -5, 5);
+
+        for (int i = 0; i < NUM_BUTTONS; i++)
+        {
+            bool current_reading = (digitalRead(BUTTON_PINS[i]) == LOW);
+            bool last_raw_bit = (last_raw_state & BUTTON_MASKS[i]) ? true : false;
+
+            if (current_reading != last_raw_bit)
+            {
+                last_debounce_time[i] = now;
+                if (current_reading)
+                    last_raw_state |= BUTTON_MASKS[i];
+                else
+                    last_raw_state &= ~BUTTON_MASKS[i];
+            }
+
+            if ((now - last_debounce_time[i]) >= debounce_delay_ms)
+            {
+                bool debounced_bit = (debounced_state & BUTTON_MASKS[i]) ? true : false;
+                if (current_reading != debounced_bit)
+                {
+                    if (current_reading)
+                        debounced_state |= BUTTON_MASKS[i];
+                    else
+                        debounced_state &= ~BUTTON_MASKS[i];
+                }
+            }
+        }
+
+        local_pkt.buttons = debounced_state;
+        g_display_buttons = debounced_state; // update for displayTask
+        bool should_send = (local_pkt.buttons != last_sent_buttons) || (local_pkt.scroll != 0);
+
+        if (should_send)
+        {
+            local_pkt.battery = local_battery;
+            local_pkt.state = 0;
+            xQueueSend(penQueue, &local_pkt, portMAX_DELAY);
+            last_sent_buttons = local_pkt.buttons;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
+// ================= TUNING TASK =================
 void tuningTask(void *pv)
 {
     uint32_t last_mode_time = 0, last_up_time = 0, last_down_time = 0, next_save_time = 0;
     vTaskDelay(pdMS_TO_TICKS(2000));
-    sendTuningToCam();
+
+    sendTuningToCam('E', val_exposure, 0, 0, 0);
+    vTaskDelay(pdMS_TO_TICKS(50));
+    sendTuningToCam('T', val_threshold, 0, 0, 0);
+    vTaskDelay(pdMS_TO_TICKS(50));
+    sendTuningToCam('V', current_v_fac, 0, 0, 0);
 
     while (1)
     {
@@ -251,7 +376,6 @@ void tuningTask(void *pv)
                     display.clearDisplay();
                     display.drawRoundRect(0, 0, 128, 64, 8, SH110X_WHITE);
                     display.setTextSize(2);
-                    display.setTextColor(SH110X_WHITE);
                     display.setCursor(15, 25);
                     display.print("REBOOTING");
                     display.display();
@@ -274,12 +398,12 @@ void tuningTask(void *pv)
             if (current_tune_mode == MODE_EXP)
             {
                 val_exposure = min(255, val_exposure + 5);
-                sendTuningToCam();
+                sendTuningToCam('E', val_exposure, 0, 0, 0);
             }
             else if (current_tune_mode == MODE_THR)
             {
                 val_threshold = min(255, val_threshold + 5);
-                sendTuningToCam();
+                sendTuningToCam('T', val_threshold, 0, 0, 0);
             }
             else if (current_tune_mode == MODE_ALP)
             {
@@ -288,7 +412,7 @@ void tuningTask(void *pv)
             else if (current_tune_mode == MODE_VEL)
             {
                 current_v_fac = min(50, current_v_fac + 2);
-                sendTuningToCam();
+                sendTuningToCam('V', current_v_fac, 0, 0, 0);
             }
             changed = true;
             last_up_time = now;
@@ -301,12 +425,12 @@ void tuningTask(void *pv)
             if (current_tune_mode == MODE_EXP)
             {
                 val_exposure = max(0, val_exposure - 5);
-                sendTuningToCam();
+                sendTuningToCam('E', val_exposure, 0, 0, 0);
             }
             else if (current_tune_mode == MODE_THR)
             {
                 val_threshold = max(0, val_threshold - 5);
-                sendTuningToCam();
+                sendTuningToCam('T', val_threshold, 0, 0, 0);
             }
             else if (current_tune_mode == MODE_ALP)
             {
@@ -315,7 +439,7 @@ void tuningTask(void *pv)
             else if (current_tune_mode == MODE_VEL)
             {
                 current_v_fac = max(0, current_v_fac - 2);
-                sendTuningToCam();
+                sendTuningToCam('V', current_v_fac, 0, 0, 0);
             }
             changed = true;
             last_down_time = now;
@@ -335,30 +459,32 @@ void tuningTask(void *pv)
     }
 }
 
-void sendTuningToCam()
+void sendTuningToCam(char cmd, int v1, int v2, int v3, int v4)
 {
-    Serial1.printf("E%d\n", val_exposure);
-    delay(10);
-    Serial1.printf("T%d\n", val_threshold);
-    delay(10);
-    Serial1.printf("V%d\n", current_v_fac);
+    cam_config_packet_t config_pkt = {cmd, v1, v2, v3, v4};
+    esp_now_send(s_cam_mac, (uint8_t *)&config_pkt, sizeof(config_pkt));
 }
 
-// ================= HIỂN THỊ OLED =================
+// ================= LASER CONTROL (send command to CAM) =================
+void sendLaserToCam(bool on)
+{
+    cam_config_packet_t pkt = {'L', on ? 1 : 0, 0, 0, 0};
+    esp_now_send(s_cam_mac, (uint8_t *)&pkt, sizeof(pkt));
+}
+
+// ================= OLED DISPLAY =================
 struct UI_State
 {
     uint32_t fps;
     bool ble_conn;
-    uint8_t pen_bat;
     uint8_t local_bat;
-    uint8_t pen_state;
     State system_state;
     TuneMode tune_mode;
     bool is_tuning;
     int exp, thr;
     float alp;
     int vfac;
-    bool is_pen_lost;
+    uint8_t buttons; // current button state for drawing hints
 };
 
 void drawBatteryIcon(int x, int y, uint8_t percent, uint8_t state, bool is_lost)
@@ -371,11 +497,6 @@ void drawBatteryIcon(int x, int y, uint8_t percent, uint8_t state, bool is_lost)
         display.setCursor(x + 4, y + 1);
         display.print(" X ");
     }
-    else if (state == 1)
-    {
-        display.setCursor(x + 3, y + 1);
-        display.print("zZ");
-    }
     else
     {
         int fill_w = map(percent, 0, 100, 0, 20);
@@ -385,7 +506,9 @@ void drawBatteryIcon(int x, int y, uint8_t percent, uint8_t state, bool is_lost)
 
 void displayTask(void *pv)
 {
-    UI_State last_ui = {0};
+    UI_State last_ui;
+    memset(&last_ui, 0, sizeof(UI_State));
+
     bool force_clear = true;
     bool is_screen_off = false;
     uint32_t last_bat_check = 0;
@@ -398,6 +521,7 @@ void displayTask(void *pv)
             vTaskDelay(pdMS_TO_TICKS(100));
             continue;
         }
+
         uint32_t now = millis();
         if (now - last_bat_check > 60000)
         {
@@ -433,11 +557,10 @@ void displayTask(void *pv)
         }
 
         UI_State curr_ui;
+        memset(&curr_ui, 0, sizeof(UI_State));
         curr_ui.fps = current_fps;
         curr_ui.ble_conn = bleMouse.isConnected();
-        curr_ui.pen_bat = pen_battery;
         curr_ui.local_bat = local_battery;
-        curr_ui.pen_state = pen_state;
         curr_ui.system_state = state;
         curr_ui.tune_mode = current_tune_mode;
         curr_ui.is_tuning = (now - last_tune_time < 3000);
@@ -445,14 +568,27 @@ void displayTask(void *pv)
         curr_ui.thr = val_threshold;
         curr_ui.alp = current_alpha;
         curr_ui.vfac = current_v_fac;
-        curr_ui.is_pen_lost = (last_pen_time == 0 || now - last_pen_time > 65000);
+        curr_ui.buttons = g_display_buttons;
 
-        bool changed = force_clear || memcmp(&curr_ui, &last_ui, sizeof(UI_State)) != 0;
+        bool changed = force_clear ||
+                       (curr_ui.fps != last_ui.fps) ||
+                       (curr_ui.ble_conn != last_ui.ble_conn) ||
+                       (curr_ui.local_bat != last_ui.local_bat) ||
+                       (curr_ui.system_state != last_ui.system_state) ||
+                       (curr_ui.tune_mode != last_ui.tune_mode) ||
+                       (curr_ui.is_tuning != last_ui.is_tuning) ||
+                       (curr_ui.exp != last_ui.exp) ||
+                       (curr_ui.thr != last_ui.thr) ||
+                       (curr_ui.alp != last_ui.alp) ||
+                       (curr_ui.vfac != last_ui.vfac) ||
+                       (curr_ui.buttons != last_ui.buttons);
+
         if (!changed)
         {
-            vTaskDelay(pdMS_TO_TICKS(50));
+            vTaskDelay(pdMS_TO_TICKS(40));
             continue;
         }
+
         if (force_clear || curr_ui.is_tuning != last_ui.is_tuning || curr_ui.system_state != last_ui.system_state)
         {
             display.clearDisplay();
@@ -465,19 +601,15 @@ void displayTask(void *pv)
             display.setTextSize(1);
             display.setCursor(16, 0);
             display.print("CHECKING SYNC");
-            display.drawRoundRect(0, 15, 60, 24, 3, SH110X_WHITE);
-            display.drawRoundRect(66, 15, 60, 24, 3, SH110X_WHITE);
-            display.setCursor(4, 23);
-            display.printf("PEN:%s", last_pen_time > 0 ? "OK" : "NO");
-            display.setCursor(70, 23);
-            display.printf("CAM:%s", (last_cam_time > 0 && (now - last_cam_time < 1500)) ? "OK" : "NO");
+            display.drawRoundRect(20, 15, 88, 24, 3, SH110X_WHITE);
+            display.setCursor(26, 23);
+            display.printf("CAM LINK: %s", (last_cam_time > 0 && (now - last_cam_time < 2000)) ? "OK" : "NO");
             display.setCursor(30, 48);
-            display.printf("S3 BAT: %d%%", curr_ui.local_bat);
+            display.printf("BATTERY: %d%%", curr_ui.local_bat);
         }
         else
         {
             display.setTextSize(1);
-            display.setCursor(0, 0);
             if (curr_ui.ble_conn)
             {
                 display.fillRect(0, 0, 18, 10, SH110X_WHITE);
@@ -492,16 +624,12 @@ void displayTask(void *pv)
                 display.setCursor(2, 1);
                 display.print("---");
             }
-
             display.setTextColor(SH110X_WHITE, SH110X_BLACK);
-            display.setCursor(20, 1);
-            display.printf("F:%-2d", curr_ui.fps);
-            display.setCursor(46, 1);
-            display.print("S:");
-            drawBatteryIcon(58, 0, curr_ui.local_bat, 0, false);
-            display.setCursor(88, 1);
-            display.print("P:");
-            drawBatteryIcon(100, 0, curr_ui.pen_bat, curr_ui.pen_state, curr_ui.is_pen_lost);
+            display.setCursor(25, 1);
+            display.printf("FPS:%-2d", curr_ui.fps);
+            display.setCursor(65, 1);
+            display.print("BAT:");
+            drawBatteryIcon(90, 0, curr_ui.local_bat, 0, false);
             display.drawLine(0, 12, 128, 12, SH110X_WHITE);
 
             display.setTextSize(2);
@@ -579,15 +707,17 @@ void updateBootScreen(int progress, const char *message)
     display.display();
 }
 
-// ================= TASK MAIN =================
+// ================= MAIN TASK (Tracking Logic & Homography) =================
 void mainTask(void *pv)
 {
     cam_packet_t camPkt;
+    State last_sent_laser_state = WAIT_SYNC; // track to avoid duplicate sends
+
     while (1)
     {
         if (state == WAIT_SYNC)
         {
-            if (last_pen_time > 0 && last_cam_time > 0 && millis() - last_cam_time < 1500)
+            if (last_cam_time > 0 && millis() - last_cam_time < 2000)
             {
                 delay(1000);
                 state = next_state;
@@ -596,20 +726,35 @@ void mainTask(void *pv)
                     int bbox[4];
                     if (preferences.getBytes("bbox", &bbox, sizeof(bbox)))
                     {
-                        Serial1.printf("B%d,%d,%d,%d\n", bbox[0], bbox[1], bbox[2], bbox[3]);
+                        sendTuningToCam('B', bbox[0], bbox[1], bbox[2], bbox[3]);
                     }
                     else
                     {
-                        Serial1.printf("C\n");
+                        sendTuningToCam('C', 0, 0, 0, 0);
                     }
+                    // Turn off laser when entering tracking from sync
+                    sendLaserToCam(false);
+                    last_sent_laser_state = TRACKING;
                 }
                 else
                 {
-                    Serial1.printf("C\n");
+                    sendTuningToCam('C', 0, 0, 0, 0);
+                    // Turn on laser when starting calibration
+                    sendLaserToCam(true);
+                    last_sent_laser_state = CAL_PT_1;
                 }
             }
             vTaskDelay(100);
             continue;
+        }
+
+        // Send laser state when state changes
+        bool in_cal = (state >= CAL_PT_1 && state <= CAL_PT_4);
+        bool last_in_cal = (last_sent_laser_state >= CAL_PT_1 && last_sent_laser_state <= CAL_PT_4);
+        if (in_cal != last_in_cal)
+        {
+            sendLaserToCam(in_cal);
+            last_sent_laser_state = state;
         }
 
         if (xQueueReceive(camQueue, &camPkt, 5))
@@ -620,7 +765,6 @@ void mainTask(void *pv)
 
             if (state == TRACKING && current_cam_x != -1 && current_cam_y != -1)
             {
-                // 1. Tính toán Homography ra độ phân giải màn hình
                 float denom = H[2][0] * current_cam_x + H[2][1] * current_cam_y + H[2][2];
                 denom = (fabsf(denom) < 0.0001f) ? 0.0001f : denom;
                 float inv_denom = 1.0f / denom;
@@ -633,18 +777,12 @@ void mainTask(void *pv)
                     {
                         if (xSemaphoreTake(hidMutex, pdMS_TO_TICKS(10)))
                         {
-                            // Dồn chuột kịch góc trên bên trái
                             for (int i = 0; i < 20; i++)
-                            {
                                 bleMouse.move(-127, -127);
-                            }
                             xSemaphoreGive(hidMutex);
                         }
-                        vTaskDelay(pdMS_TO_TICKS(15)); // Chờ Windows di chuyển xong
-
-                        // Chạy từ (0,0) đến điểm Laser hiện tại
-                        int dx = (int)sx;
-                        int dy = (int)sy;
+                        vTaskDelay(pdMS_TO_TICKS(15));
+                        int dx = (int)sx, dy = (int)sy;
                         if (xSemaphoreTake(hidMutex, pdMS_TO_TICKS(10)))
                         {
                             while (dx > 0 || dy > 0)
@@ -658,7 +796,6 @@ void mainTask(void *pv)
                             xSemaphoreGive(hidMutex);
                         }
                     }
-                    // Khởi tạo xong, bắt đầu ghi nhận mốc
                     exact_mouse_x = sx;
                     exact_mouse_y = sy;
                     smooth_x = sx;
@@ -669,16 +806,12 @@ void mainTask(void *pv)
                 }
                 else
                 {
-                    // -------------------------------------------------------------
-                    // DI CHUYỂN BÌNH THƯỜNG BẰNG GIA SỐ (RELATIVE)
-                    // -------------------------------------------------------------
                     exact_mouse_x = current_alpha * sx + (1.0f - current_alpha) * exact_mouse_x;
                     exact_mouse_y = current_alpha * sy + (1.0f - current_alpha) * exact_mouse_y;
 
                     float dx_float = (exact_mouse_x - smooth_x) + remainder_x;
                     float dy_float = (exact_mouse_y - smooth_y) + remainder_y;
-                    int total_dx = (int)dx_float;
-                    int total_dy = (int)dy_float;
+                    int total_dx = (int)dx_float, total_dy = (int)dy_float;
                     remainder_x = dx_float - total_dx;
                     remainder_y = dy_float - total_dy;
                     smooth_x = exact_mouse_x;
@@ -704,7 +837,7 @@ void mainTask(void *pv)
             }
             else if (current_cam_x == -1)
             {
-                mouse_initialized = false; // Mất tia laser -> Reset cờ để ép góc ở lần tới
+                mouse_initialized = false;
             }
         }
 
@@ -715,7 +848,10 @@ void mainTask(void *pv)
             {
                 state = CAL_PT_1;
                 mouse_initialized = false;
-                Serial1.printf("C\n");
+                sendTuningToCam('C', 0, 0, 0, 0);
+                // Turn on laser when user presses button to start calibration again
+                sendLaserToCam(true);
+                last_sent_laser_state = CAL_PT_1;
             }
             else if (state >= CAL_PT_1 && state <= CAL_PT_4)
             {
@@ -741,88 +877,25 @@ void mainTask(void *pv)
                         }
                         int bbox[4] = {(int)min_x, (int)max_x, (int)min_y, (int)max_y};
                         preferences.putBytes("bbox", &bbox, sizeof(bbox));
-                        Serial1.printf("B%d,%d,%d,%d\n", bbox[0], bbox[1], bbox[2], bbox[3]);
+                        sendTuningToCam('B', bbox[0], bbox[1], bbox[2], bbox[3]);
+                        // Turn off laser when calibration complete, switch to tracking
+                        sendLaserToCam(false);
+                        last_sent_laser_state = TRACKING;
                         state = TRACKING;
                     }
                     else
                     {
                         state = (State)(state + 1);
+                        // Keep laser on throughout CAL process
+                        last_sent_laser_state = state;
                     }
                 }
             }
         }
     }
 }
-void ledTask(void *pv)
-{
-    bool blink = false;
-    while (1)
-    {
-        if (state == WAIT_SYNC)
-        {
-            digitalWrite(LED_R_PIN, blink);
-            digitalWrite(LED_G_PIN, LOW);
-            digitalWrite(LED_B_PIN, LOW);
-            digitalWrite(LASER_CROSS_PIN, HIGH);
-            blink = !blink;
-            vTaskDelay(pdMS_TO_TICKS(500));
-        }
-        else if (state >= CAL_PT_1 && state <= CAL_PT_4)
-        {
-            digitalWrite(LED_R_PIN, LOW);
-            digitalWrite(LED_G_PIN, LOW);
-            digitalWrite(LED_B_PIN, HIGH);
-            digitalWrite(LASER_CROSS_PIN, HIGH);
-            vTaskDelay(pdMS_TO_TICKS(100));
-        }
-        else if (state == TRACKING)
-        {
-            digitalWrite(LED_R_PIN, LOW);
-            digitalWrite(LED_G_PIN, HIGH);
-            digitalWrite(LED_B_PIN, LOW);
-            if (!bleMouse.isConnected())
-            {
-                digitalWrite(LED_G_PIN, LOW);
-                digitalWrite(LED_B_PIN, HIGH);
-            }
-            digitalWrite(LASER_CROSS_PIN, LOW);
-            vTaskDelay(pdMS_TO_TICKS(100));
-        }
-    }
-}
 
-void camUartTask(void *pv)
-{
-    cam_uart_packet_t pkt;
-    uint8_t *ptr = (uint8_t *)&pkt;
-    int bytesRead = 0;
-    while (1)
-    {
-        while (Serial1.available())
-        {
-            uint8_t b = Serial1.read();
-            if (bytesRead == 0 && b != 0xAA)
-                continue;
-            if (bytesRead == 1 && b != 0x55)
-            {
-                bytesRead = 0;
-                continue;
-            }
-            ptr[bytesRead++] = b;
-            if (bytesRead == sizeof(cam_uart_packet_t))
-            {
-                cam_packet_t camPkt;
-                camPkt.x = pkt.x;
-                camPkt.y = pkt.y;
-                xQueueOverwrite(camQueue, &camPkt);
-                last_cam_time = millis();
-                bytesRead = 0;
-            }
-        }
-        vTaskDelay(pdMS_TO_TICKS(2));
-    }
-}
-
+// ================= MOUSE KEY PROCESSING TASK =================
 void penTask(void *pv)
 {
     pen_packet_t packet;
@@ -873,6 +946,7 @@ void penTask(void *pv)
     }
 }
 
+// ================= CALCULATE HOMOGRAPHY MATRIX =================
 void computeHomography()
 {
     double dst[4][2] = {{0, 0}, {(double)screen_w, 0}, {(double)screen_w, (double)screen_h}, {0, (double)screen_h}};
@@ -880,10 +954,8 @@ void computeHomography()
     memset(a, 0, sizeof(a));
     for (int i = 0; i < 4; i++)
     {
-        double x = cam_pts[i][0];
-        double y = cam_pts[i][1];
-        double u = dst[i][0];
-        double v = dst[i][1];
+        double x = cam_pts[i][0], y = cam_pts[i][1];
+        double u = dst[i][0], v = dst[i][1];
         a[i * 2][0] = x;
         a[i * 2][1] = y;
         a[i * 2][2] = 1;
@@ -911,9 +983,9 @@ void computeHomography()
                 pivot = j;
         for (int j = i; j < 9; j++)
         {
-            double temp = a[i][j];
+            double tmp = a[i][j];
             a[i][j] = a[pivot][j];
-            a[pivot][j] = temp;
+            a[pivot][j] = tmp;
         }
         if (fabs(a[i][i]) < 1e-6)
             return;
@@ -932,7 +1004,6 @@ void computeHomography()
             sum += a[i][j] * h[j];
         h[i] = (a[i][8] - sum) / a[i][i];
     }
-
     H[0][0] = (float)h[0];
     H[0][1] = (float)h[1];
     H[0][2] = (float)h[2];
@@ -945,11 +1016,9 @@ void computeHomography()
 
     double norm = sqrt(h[0] * h[0] + h[1] * h[1] + h[2] * h[2] + h[3] * h[3] + h[4] * h[4] + h[5] * h[5] + h[6] * h[6] + h[7] * h[7] + 1.0);
     if (norm > 1e-6)
-    {
         for (int i = 0; i < 3; i++)
             for (int j = 0; j < 3; j++)
                 H[i][j] /= (float)norm;
-    }
 
     preferences.putBytes("matrix_H", &H, sizeof(H));
 }
